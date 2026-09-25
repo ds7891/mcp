@@ -1,13 +1,16 @@
 package com.mcp.injector.agent
 
 import android.content.Context
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
+import com.mcp.injector.bridge.OfficialModule
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileWriter
 import java.security.MessageDigest
+import java.util.zip.ZipFile
 
 /**
  * 已注入应用记录（任务 C 支撑文件）。
@@ -31,7 +34,7 @@ data class InjectedApp(
     val port: Int,
     val modules: List<String>,
     val injectedAt: Long,
-    /** "history"（注入历史）或 "scan"（同签名扫描）。 */
+    /** "history"（注入历史）、"marker"（目标 APK 内标记识别）或 "scan"（同签名扫描）。 */
     val source: String,
     /** 注入产物 APK 相对 filesDir 的路径（可用于安装/复检）。 */
     val outputRelative: String? = null,
@@ -178,15 +181,27 @@ class InjectedAppsStore(private val context: Context) {
     }
 }
 
-/** 同签名扫描：找出与注入器同签名的已安装应用（指纹识别来源二）。 */
+/** 已注入应用识别：APK 内标记优先，同签名扫描兜底（指纹识别来源二）。 */
 object InjectedAppScanner {
 
+    /** APK 内的注入标记资产名（与 [ApkInjector] 写入、OfficialModule 校验的名字一致）。 */
+    private const val MARKER_ENTRY = "assets/" + OfficialModule.MARKER_FILE
+
+    /** 来源：按目标 APK 内的注入标记识别（不依赖注入器自身的密钥与历史文件）。 */
+    const val SOURCE_MARKER = "marker"
+
     /**
-     * 扫描已安装应用中与宿主同签名的应用，产出 source="scan" 的 [InjectedApp] 列表。
-     * 已存在于历史中的包名跳过（由历史记录覆盖展示）。
+     * 扫描已安装应用中「由本注入器注入过」的应用。
+     *
+     * 两条来源，按可靠性排序：
+     * 1. **APK 内注入标记**（[SOURCE_MARKER]）：注入时写进 `assets/.mcp_injector_marker`，
+     *    随目标 APK 一直存在。**卸载并重装注入器后**历史文件与重签名密钥都会随 filesDir 清空，
+     *    但目标 APK 里的标记还在，因此仍能被识别与管理；
+     * 2. **同签名**（source="scan"）：与本注入器同签名的应用（用户用同一密钥自行签名的场景）。
+     *
+     * 已存在于历史中的包名跳过（由历史记录覆盖展示，信息更全）。
      */
     fun scan(context: Context, store: InjectedAppsStore): List<InjectedApp> {
-        val hostFp = store.sigFingerprint() ?: return emptyList()
         val existing = store.loadAll().map { it.packageName }.toSet()
         val pm = context.packageManager
         val out = ArrayList<InjectedApp>()
@@ -194,23 +209,88 @@ object InjectedAppScanner {
             val pkg = pi.packageName ?: continue
             if (pkg == context.packageName) continue
             if (pkg in existing) continue
-            val fp = InjectedAppsStore.fingerprintOf(context, pkg) ?: continue
-            if (fp != hostFp) continue
-            val label = pi.applicationInfo?.loadLabel(pm)?.toString() ?: pkg
-            out.add(
-                InjectedApp(
-                    installId = "scan:$pkg",
-                    packageName = pkg,
-                    appName = label,
-                    versionName = pi.versionName ?: "",
-                    signatureFingerprint = fp,
-                    port = 0,
-                    modules = emptyList(),
-                    injectedAt = System.currentTimeMillis(),
-                    source = "scan",
-                ),
-            )
+            recognize(context, store, pkg, pi)?.let { out.add(it) }
         }
         return out.sortedByDescending { it.injectedAt }
+    }
+
+    /** 识别单个已安装应用；不是本注入器注入的返回 null。 */
+    fun recognize(context: Context, store: InjectedAppsStore, packageName: String): InjectedApp? {
+        if (packageName.isEmpty() || packageName == context.packageName) return null
+        val pm = context.packageManager
+        val pi = runCatching { pm.getPackageInfo(packageName, 0) }.getOrNull() ?: return null
+        return recognize(context, store, packageName, pi)
+    }
+
+    private fun recognize(
+        context: Context,
+        store: InjectedAppsStore,
+        pkg: String,
+        pi: PackageInfo,
+    ): InjectedApp? {
+        val label = runCatching { pi.applicationInfo?.loadLabel(context.packageManager)?.toString() }
+            .getOrNull() ?: pkg
+        val version = pi.versionName ?: ""
+        // 来源 1：APK 内注入标记（重装注入器后唯一可靠的依据）
+        readMarker(pi.applicationInfo?.sourceDir)?.let { marker ->
+            return fromMarker(pkg, label, version, marker)
+        }
+        // 来源 2：与本注入器同签名
+        val hostFp = store.sigFingerprint() ?: return null
+        val fp = InjectedAppsStore.fingerprintOf(context, pkg) ?: return null
+        if (fp != hostFp) return null
+        return InjectedApp(
+            installId = "scan:$pkg",
+            packageName = pkg,
+            appName = label,
+            versionName = version,
+            signatureFingerprint = fp,
+            port = 0,
+            modules = emptyList(),
+            injectedAt = System.currentTimeMillis(),
+            source = "scan",
+        )
+    }
+
+    /** 读取已安装 APK 的 `assets/.mcp_injector_marker`；不存在或不可读返回 null。 */
+    private fun readMarker(apkPath: String?): JSONObject? {
+        apkPath ?: return null
+        return runCatching {
+            ZipFile(apkPath).use { zip ->
+                val entry = zip.getEntry(MARKER_ENTRY) ?: return@use null
+                val text = zip.getInputStream(entry).use { it.readBytes().decodeToString() }
+                JSONObject(text)
+            }
+        }.getOrNull()
+    }
+
+    /** 用标记内容还原注入信息（端口/策略/入口/模块/注入时间，均可直接展示与回灌 AI）。 */
+    private fun fromMarker(
+        pkg: String,
+        label: String,
+        version: String,
+        marker: JSONObject,
+    ): InjectedApp {
+        val modules = marker.optJSONArray("modules")?.let { arr ->
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }
+            }
+        } ?: emptyList()
+        return InjectedApp(
+            installId = marker.optString("installId").takeIf { it.isNotEmpty() } ?: "marker:$pkg",
+            packageName = pkg,
+            appName = label,
+            versionName = marker.optString("appVersion").takeIf { it.isNotEmpty() } ?: version,
+            // 标记里不含目标签名指纹；留空由 UI 显示「未知」，避免把宿主指纹错记到目标上
+            signatureFingerprint = "",
+            port = marker.optInt("port", 0),
+            modules = modules,
+            injectedAt = marker.optLong("injectedAt", 0L).takeIf { it > 0L }
+                ?: System.currentTimeMillis(),
+            source = SOURCE_MARKER,
+            strategy = marker.optString("strategy").takeIf { it.isNotEmpty() },
+            entryPoint = marker.optString("entryPoint").takeIf { it.isNotEmpty() },
+            toastOnBoot = marker.optBoolean("toastOnBoot", true),
+        )
     }
 }

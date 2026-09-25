@@ -25,7 +25,9 @@ import com.mcp.injector.data.ChatSession
 import com.mcp.injector.data.Project
 import com.mcp.injector.data.ProjectsStore
 import com.mcp.injector.data.SettingsRepository
+import com.mcp.injector.data.resolveStoredFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -61,6 +63,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _events = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val events = _events.asSharedFlow()
+
+    /** 最近一次刷新任务：新的刷新会先取消它，避免旧快照后写覆盖新状态。 */
+    private var refreshJob: Job? = null
 
     /** 主页 UI 状态：原工程列表 + 已注入应用（历史+扫描）+ 当前模型 + 忙碌标记 + 策略对话。 */
     data class UiState(
@@ -122,15 +127,26 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 刷新工程列表与已注入应用（历史 + 同签名扫描）。 */
-    fun refresh() {
+    /**
+     * 刷新工程列表与已注入应用（历史 + 标记/同签名识别）。读盘与扫 APK 走 IO。
+     *
+     * @param scanInjected 是否重做「已注入应用」识别扫描。该扫描要逐个打开已安装 APK 读 assets，
+     *        较重；注入过程中的进度刷新只关心工程列表，传 false 可复用上一步结果，避免重复扫描。
+     *        同时取消上一次未完成的刷新，防止旧的快照后写覆盖新状态。
+     */
+    fun refresh(scanInjected: Boolean = true) {
         val app = getApplication<Application>()
-        val scanned = InjectedAppScanner.scan(app, injectedStore)
-        _state.update {
-            it.copy(
-                projects = store.loadAll(),
-                injectedApps = injectedStore.loadAll() + scanned,
-            )
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            val projects = withContext(Dispatchers.IO) { store.loadAll() }
+            val injected = if (scanInjected) {
+                withContext(Dispatchers.IO) {
+                    injectedStore.loadAll() + InjectedAppScanner.scan(app, injectedStore)
+                }
+            } else {
+                _state.value.injectedApps
+            }
+            _state.update { it.copy(projects = projects, injectedApps = injected) }
         }
     }
 
@@ -154,11 +170,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     iconFile = iconRel,
                 )
                 store.upsert(proj)
-                refresh()
+                refresh(scanInjected = false)
 
                 proj = proj.copy(status = Project.Status.ANALYZING)
                 store.upsert(proj)
-                refresh()
+                refresh(scanInjected = false)
                 // 先取设置：dex 扫描规模由模型上下文窗口决定（小窗口别把提示词撑爆）
                 val settings = settingsRepo.current()
                 val hints = withContext(Dispatchers.IO) {
@@ -167,12 +183,12 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
                 proj = proj.copy(status = Project.Status.PLANNING)
                 store.upsert(proj)
-                refresh()
+                refresh(scanInjected = false)
                 val plan = planner.plan(info, hints, settings)
 
                 proj = proj.copy(status = Project.Status.INJECTING)
                 store.upsert(proj)
-                refresh()
+                refresh(scanInjected = false)
                 val output = File(store.outputDir(), sanitize(info.packageName) + "-mcp.apk")
                 withContext(Dispatchers.IO) { injector.inject(copied, info, plan, output) }
 
@@ -223,13 +239,13 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 注入产物 APK 文件（filesDir 相对路径解析）。 */
+    /** 注入产物 APK 文件（filesDir 相对路径解析；绝对路径直接用）。 */
     fun outputFor(project: Project): File? =
-        project.outputRelative?.let { File(getApplication<Application>().filesDir, it) }
+        resolveStoredFile(getApplication<Application>().filesDir, project.outputRelative)
 
     /** 工程图标文件。 */
     fun iconOf(project: Project): File? =
-        project.iconFile?.let { File(getApplication<Application>().filesDir, it) }
+        resolveStoredFile(getApplication<Application>().filesDir, project.iconFile)
 
     // ---------------------------------------------------------------------
     // AI 策略对话（长按工程 / 已注入卡片打开）
@@ -238,26 +254,36 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     /** 打开策略对话并异步取回目标侧诊断/崩溃栈，作为 AI 判断现状的依据。 */
     fun openStrategyChat(packageName: String) {
         if (packageName.isEmpty()) return
-        val record = injectedStore.find(packageName)
-        val project = store.loadAll().firstOrNull { it.packageName == packageName }
-        val appName = record?.appName ?: project?.appName ?: packageName
-        // 续上最近一次会话（历史记录第一等公民），没有则新开一条
-        val sessions = chatStore.listFor(packageName)
-        val latest = sessions.firstOrNull()
+        // 先立刻把弹窗挂上（历史会话的读盘放到 IO，避免点击时卡主线程）
         _state.update {
             it.copy(
                 strategyChat = StrategyChatState(
                     packageName = packageName,
-                    appName = appName,
-                    sessionId = latest?.id ?: UUID.randomUUID().toString(),
-                    turns = latest?.turns ?: emptyList(),
+                    appName = packageName,
                     contextNote = "正在取回目标侧诊断与崩溃栈…",
-                    sessions = sessions,
                 ),
             )
         }
         viewModelScope.launch {
             val appCtx = getApplication<Application>()
+            val record = withContext(Dispatchers.IO) { recordFor(packageName) }
+            val project = withContext(Dispatchers.IO) { mainProject(packageName) }
+            // 续上最近一次会话（历史记录第一等公民），没有则沿用新建的空会话
+            val sessions = withContext(Dispatchers.IO) { chatStore.listFor(packageName) }
+            val latest = sessions.firstOrNull()
+            val appName = record?.appName ?: project?.appName ?: packageName
+            _state.update { state ->
+                val chat = state.strategyChat ?: return@update state
+                if (chat.packageName != packageName) return@update state
+                state.copy(
+                    strategyChat = chat.copy(
+                        appName = appName,
+                        sessionId = latest?.id ?: chat.sessionId,
+                        turns = latest?.turns ?: emptyList(),
+                        sessions = sessions,
+                    ),
+                )
+            }
             val diagnose = probeJson(appCtx, packageName, "diagnose")
             val crashLog = probeJson(appCtx, packageName, "crash")
                 ?.optString("log")?.takeIf { s -> s.isNotBlank() }
@@ -282,40 +308,51 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- 对话历史记录 ----
 
-    /** 打开/关闭历史记录面板（打开时刷新列表）。 */
+    /** 打开/关闭历史记录面板（打开时刷新列表；列表读取走 IO，不占主线程）。 */
     fun toggleChatHistory() {
-        _state.update { state ->
-            val c = state.strategyChat ?: return@update state
-            val open = !c.historyOpen
-            state.copy(
-                strategyChat = c.copy(
-                    historyOpen = open,
-                    sessions = if (open) chatStore.listFor(c.packageName) else c.sessions,
-                    error = null,
-                ),
-            )
+        val chat = _state.value.strategyChat ?: return
+        val open = !chat.historyOpen
+        if (!open) {
+            _state.update { state ->
+                val c = state.strategyChat ?: return@update state
+                state.copy(strategyChat = c.copy(historyOpen = false, error = null))
+            }
+            return
+        }
+        viewModelScope.launch {
+            val sessions = withContext(Dispatchers.IO) { chatStore.listFor(chat.packageName) }
+            _state.update { state ->
+                val c = state.strategyChat ?: return@update state
+                if (c.packageName != chat.packageName) return@update state
+                state.copy(strategyChat = c.copy(historyOpen = true, sessions = sessions, error = null))
+            }
         }
     }
 
     /** 打开某条历史会话，作为「当前对话」继续（AI 只回灌这一条会话的上下文）。 */
     fun openChatSession(sessionId: String) {
-        val session = chatStore.find(sessionId) ?: return
-        _state.update { state ->
-            val c = state.strategyChat ?: return@update state
-            if (c.packageName != session.packageName) return@update state
-            state.copy(
-                strategyChat = c.copy(
-                    sessionId = session.id,
-                    turns = session.turns,
-                    input = "",
-                    historyOpen = false,
-                    // 换了会话，上一会话累积的补丁不能带过来
-                    pendingPatch = StrategyPatch(),
-                    changes = emptyList(),
-                    needsToolReplan = false,
-                    error = null,
-                ),
-            )
+        val chat = _state.value.strategyChat ?: return
+        viewModelScope.launch {
+            val session = withContext(Dispatchers.IO) { chatStore.find(sessionId) } ?: return@launch
+            _state.update { state ->
+                val c = state.strategyChat ?: return@update state
+                if (c.packageName != session.packageName || session.packageName != chat.packageName) {
+                    return@update state
+                }
+                state.copy(
+                    strategyChat = c.copy(
+                        sessionId = session.id,
+                        turns = session.turns,
+                        input = "",
+                        historyOpen = false,
+                        // 换了会话，上一会话累积的补丁不能带过来
+                        pendingPatch = StrategyPatch(),
+                        changes = emptyList(),
+                        needsToolReplan = false,
+                        error = null,
+                    ),
+                )
+            }
         }
     }
 
@@ -338,22 +375,29 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 删除一条历史会话；删的是当前会话时顺带新开一条空会话。 */
+    /** 删除一条历史会话；删的是当前会话时顺带新开一条空会话。删盘走 IO，不占主线程。 */
     fun deleteChatSession(sessionId: String) {
-        chatStore.remove(sessionId)
-        _state.update { state ->
-            val c = state.strategyChat ?: return@update state
-            val currentDeleted = c.sessionId == sessionId
-            state.copy(
-                strategyChat = c.copy(
-                    sessions = chatStore.listFor(c.packageName),
-                    sessionId = if (currentDeleted) UUID.randomUUID().toString() else c.sessionId,
-                    turns = if (currentDeleted) emptyList() else c.turns,
-                    pendingPatch = if (currentDeleted) StrategyPatch() else c.pendingPatch,
-                    changes = if (currentDeleted) emptyList() else c.changes,
-                    needsToolReplan = if (currentDeleted) false else c.needsToolReplan,
-                ),
-            )
+        val chat = _state.value.strategyChat ?: return
+        viewModelScope.launch {
+            val sessions = withContext(Dispatchers.IO) {
+                chatStore.remove(sessionId)
+                chatStore.listFor(chat.packageName)
+            }
+            _state.update { state ->
+                val c = state.strategyChat ?: return@update state
+                if (c.packageName != chat.packageName) return@update state
+                val currentDeleted = c.sessionId == sessionId
+                state.copy(
+                    strategyChat = c.copy(
+                        sessions = sessions,
+                        sessionId = if (currentDeleted) UUID.randomUUID().toString() else c.sessionId,
+                        turns = if (currentDeleted) emptyList() else c.turns,
+                        pendingPatch = if (currentDeleted) StrategyPatch() else c.pendingPatch,
+                        changes = if (currentDeleted) emptyList() else c.changes,
+                        needsToolReplan = if (currentDeleted) false else c.needsToolReplan,
+                    ),
+                )
+            }
         }
     }
 
@@ -404,8 +448,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         persistChat(sessionId, packageName, userTurns)
         viewModelScope.launch {
             try {
-                val record = injectedStore.find(packageName)
-                val project = store.loadAll().firstOrNull { it.packageName == packageName }
+                val record = withContext(Dispatchers.IO) { recordFor(packageName) }
+                val project = mainProject(packageName)
                 val current = buildCurrentStrategy(record, project)
                 val revision = planner.reviseStrategy(
                     packageName = packageName,
@@ -418,7 +462,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     settings = settingsRepo.current(),
                 )
                 // —— 本地判定：AI 之外的第二道保险 ——
-                val toolIssue = detectToolIssue(
+                // 与已有标记取并集：一旦某一轮判定为工具问题，后续轮次（用户只说「按你说的来」这类
+                // 不含关键词的回复）不能把它重置掉，否则「应用并重新注入」会被「无改动」挡住。
+                val toolIssue = chat.needsToolReplan || detectToolIssue(
                     problem = problem,
                     diagnoseJson = _state.value.strategyChat?.diagnoseJson,
                     toolsCount = current.toolsCount,
@@ -505,7 +551,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val appCtx = getApplication<Application>()
-                val project = store.loadAll().firstOrNull { it.packageName == packageName }
+                val project = mainProject(packageName)
                 val source = resolveSourceApk(appCtx, packageName)
                     ?: throw IllegalStateException("缺少源 APK / 注入产物，无法重新注入")
                 val info = withContext(Dispatchers.IO) { ApkParser.parse(source) }
@@ -548,7 +594,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                         store.backupOutput(
                             packageName = packageName,
                             template = proj,
-                            previousOutput = proj.outputRelative?.let { File(appCtx.filesDir, it) },
+                            previousOutput = resolveStoredFile(appCtx.filesDir, proj.outputRelative),
                         )
                     }
                 }
@@ -712,9 +758,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     /** 重新注入源 APK：原始导入副本优先，注入产物兜底。 */
     private fun resolveSourceApk(appCtx: Application, packageName: String): File? {
         val record = injectedStore.find(packageName)
-        record?.sourceRelative?.let { File(appCtx.filesDir, it) }
+        resolveStoredFile(appCtx.filesDir, record?.sourceRelative)
             ?.takeIf { it.exists() }?.let { return it }
-        return record?.outputRelative?.let { File(appCtx.filesDir, it) }?.takeIf { it.exists() }
+        return resolveStoredFile(appCtx.filesDir, record?.outputRelative)?.takeIf { it.exists() }
     }
 
     /** 补丁并集：新值为 null 时保留旧值，非 null 覆盖旧值。 */
@@ -724,8 +770,22 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         strategy = next.strategy ?: base.strategy,
         connectionMode = next.connectionMode ?: base.connectionMode,
         port = next.port ?: base.port,
+        // tools 也要并集：漏掉它会静默丢弃 AI 给出的工具集（字段看起来可用、实际永不生效）
+        tools = next.tools ?: base.tools,
         explanation = next.explanation.ifBlank { base.explanation },
     )
+
+    /** 该包名的「注入版本」工程（排除自动生成的「备份」条目，避免把备份当主工程改动）。 */
+    private fun mainProject(packageName: String): Project? =
+        store.loadAll().firstOrNull { it.packageName == packageName && !it.isBackup }
+
+    /**
+     * 该包名的注入记录：优先注入历史；历史缺失（例如注入器被卸载重装过，filesDir 已清空）
+     * 时按目标 APK 内的注入标记识别，这样识别出来的应用也能拿到真实端口/策略回灌 AI。
+     */
+    private fun recordFor(packageName: String): InjectedApp? =
+        injectedStore.find(packageName)
+            ?: InjectedAppScanner.recognize(getApplication(), injectedStore, packageName)
 
     /** 标记对话出错：停止忙碌态并记录可读原因。 */
     private fun failChat(packageName: String, message: String) {
@@ -775,10 +835,12 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         /** 与 AiPlanner 缺省端口对齐（注入历史无端口时展示/回灌用）。 */
         const val DEFAULT_PORT = 1732
 
-        /** 工具类问题的否定词（与「工具/注册表」同时出现才判定）。 */
+        /** 工具类问题的否定词（与「工具/注册表」同时出现才判定）。
+         *  刻意不收单字「空」：它会在「空白」「空闲」等无关表述里造成误判，
+         *  而误判的代价是真的重新规划并改动产物。 */
         val NEGATIVE_WORDS = listOf(
             "没有", "看不到", "不显示", "没显", "缺失", "为空", "获取不到", "找不到",
-            "没出现", "没有出现", "失败", "不全", "不完整", "空",
+            "没出现", "没有出现", "失败", "不全", "不完整",
         )
 
         /** 启动期崩溃特征词（含校验器/初始化异常与目标侧注入体栈）。 */

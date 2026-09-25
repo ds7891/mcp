@@ -1,6 +1,7 @@
 package com.mcp.injector.ui.settings
 
 import android.content.Intent
+import android.os.Build
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -201,11 +202,19 @@ fun SettingsScreen(
                                 )
                             }
                             Spacer(Modifier.height(8.dp))
+                            // API 31+ 走系统原生 Material You；低版本没有 system_accent* 资源，
+                            // 主题层会用「系统主题色 + 色调派生」近似实现，不再闪退，因此开关保持可用。
+                            val nativeDynamicSupported =
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("动态取色", style = MaterialTheme.typography.bodyLarge)
                                     Text(
-                                        text = "使用系统 Material You 动态色板",
+                                        text = if (nativeDynamicSupported) {
+                                            "使用系统 Material You 原生色板"
+                                        } else {
+                                            "当前系统不支持原生动态色，使用系统主题色近似生成"
+                                        },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )

@@ -1,6 +1,7 @@
 package com.mcp.injector.apk
 
 import android.content.Context
+import com.mcp.injector.InjectorApp
 import com.mcp.injector.ai.InjectionPlan
 import com.mcp.injector.agent.InjectedApp
 import com.mcp.injector.agent.InjectedAppsStore
@@ -158,7 +159,9 @@ class ApkInjector(private val context: Context) {
         }
 
         // ---- 9. 记录历史（包名、签名指纹、installId、端口、模块）----
-        val store = InjectedAppsStore(context)
+        // 必须复用应用级单例：自己 new 一份会与 ViewModel 各持一个实例，@Synchronized
+        // 便不再跨实例生效，两边同时读改写 injected_apps.json 会互相覆盖、丢注入历史。
+        val store: InjectedAppsStore = InjectorApp.getInstance().injectedAppsStore
         val record = InjectedApp(
             installId = installId,
             packageName = info.packageName,

@@ -64,6 +64,7 @@ class ProjectsStore(private val context: Context) {
         File(context.filesDir, "projects.json").apply { parentFile?.mkdirs() }
 
     /** 全部工程（文件缺失或损坏时返回空列表）。 */
+    @Synchronized
     fun loadAll(): List<Project> {
         if (!file().exists()) return emptyList()
         return runCatching {
@@ -71,6 +72,7 @@ class ProjectsStore(private val context: Context) {
         }.getOrDefault(emptyList())
     }
 
+    @Synchronized
     fun saveAll(projects: List<Project>) {
         val target = file()
         // 原子写：先写同目录临时文件再 rename 覆盖目标。直接 writeText 覆盖时若中途被杀/异常
@@ -85,20 +87,21 @@ class ProjectsStore(private val context: Context) {
     }
 
     /** 按 id 去重插入，按创建时间倒序保存，返回保存后的完整列表。 */
+    @Synchronized
     fun upsert(project: Project): List<Project> {
         val all = loadAll().filter { it.id != project.id } + project
         saveAll(all.sortedByDescending { it.createdAt })
         return all
     }
 
+    @Synchronized
     fun remove(id: String): List<Project> {
         val all = loadAll().filter { it.id != id }
         saveAll(all)
         return all
     }
 
-    fun iconFile(project: Project): File? =
-        project.iconFile?.let { File(context.filesDir, it) }
+    fun iconFile(project: Project): File? = resolveStoredFile(context.filesDir, project.iconFile)
 
     /** 注入产物输出目录（filesDir/outputs）。 */
     fun outputDir(): File =
@@ -146,3 +149,14 @@ class ProjectsStore(private val context: Context) {
     private fun sanitizeName(raw: String): String =
         raw.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
 }
+
+/**
+ * 解析工程/注入历史里存的产物路径。
+ *
+ * 这些字段绝大多数是相对 `filesDir` 的路径，但 [com.mcp.injector.agent.InjectedApp.outputRelative]
+ * 在产物不位于 filesDir 之下时会回退成**绝对路径**（见 ApkInjector）。此时若仍按
+ * `File(filesDir, path)` 拼接，Unix 下会得到 `filesDir + "/abs/path"` 这种不存在的路径，
+ * 安装/备份/重新注入都会静默"找不到产物"。这里按是否绝对路径分别处理。
+ */
+fun resolveStoredFile(filesDir: File, stored: String?): File? =
+    stored?.let { if (File(it).isAbsolute) File(it) else File(filesDir, it) }

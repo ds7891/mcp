@@ -229,7 +229,14 @@ private fun InfoCard(app: InjectedApp) {
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.weight(1f),
                 )
-                StatusChip(status = if (app.source == "scan") "同签名" else "历史")
+                StatusChip(
+                    status = when (app.source) {
+                        "scan" -> "同签名"
+                        // APK 内注入标记识别：注入器重装后历史丢失，但目标应用仍被认出
+                        "marker" -> "已识别"
+                        else -> "历史"
+                    },
+                )
             }
             KeyValueRow("包名", app.packageName)
             KeyValueRow("版本", app.versionName)
@@ -449,15 +456,25 @@ private fun ReinjectCard(
 ) {
     DetailCard {
         Column(modifier = Modifier.padding(16.dp)) {
-            val source = if (app.source == "scan") "同签名扫描来源，无注入副本" else "有注入副本（源 APK 优先）"
+            val source = when (app.source) {
+                "scan" -> "同签名扫描来源，无注入副本"
+                "marker" -> "APK 内标记识别（宿主重装后无本地副本）"
+                else -> "有注入副本（源 APK 优先）"
+            }
             KeyValueRow("可用源", source)
-            Button(onClick = onReinject, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            // 同签名 / 标记识别来源没有本地副本，重新注入必定失败，直接禁用而不是等报错
+            val hasLocalCopy = app.source != "scan" && app.source != "marker"
+            Button(
+                onClick = onReinject,
+                enabled = !busy && hasLocalCopy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
                 Text("重新注入")
             }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = onInstall,
-                enabled = !busy,
+                enabled = !busy && hasLocalCopy,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("安装当前产物")

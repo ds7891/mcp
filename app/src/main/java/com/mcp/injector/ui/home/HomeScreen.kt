@@ -263,6 +263,8 @@ private fun InjectedAppCard(app: InjectedApp, onClick: () -> Unit, onLongClick: 
 
 private fun sourceLabel(source: String): String = when (source) {
     "scan" -> "同签名"
+    // 目标 APK 内自带注入标记：注入器重装后历史已丢，但应用仍被识别出来
+    "marker" -> "已识别"
     else -> "历史"
 }
 

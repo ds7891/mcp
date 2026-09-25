@@ -43,6 +43,7 @@ class ChatHistoryStore(private val context: Context) {
         File(context.filesDir, "chat_history.json").apply { parentFile?.mkdirs() }
 
     /** 全部会话（文件缺失或损坏时返回空列表）。 */
+    @Synchronized
     fun loadAll(): List<ChatSession> {
         if (!file().exists()) return emptyList()
         return runCatching {
@@ -50,8 +51,10 @@ class ChatHistoryStore(private val context: Context) {
         }.getOrDefault(emptyList())
     }
 
+    @Synchronized
     fun saveAll(sessions: List<ChatSession>) {
         val target = file()
+        // 固定 tmp 名 + 读改写：必须串行，否则并发写会互相覆盖（丢会话）。
         val tmp = File(target.parentFile, target.name + ".tmp")
         tmp.writeText(json.encodeToString(sessions))
         if (target.exists()) target.delete()
@@ -68,6 +71,7 @@ class ChatHistoryStore(private val context: Context) {
     fun find(id: String): ChatSession? = loadAll().firstOrNull { it.id == id }
 
     /** 插入/更新一条会话：保留原 createdAt，刷新 updatedAt，并按包名裁剪条数。 */
+    @Synchronized
     fun upsert(session: ChatSession) {
         val all = loadAll()
         val existing = all.firstOrNull { it.id == session.id }
@@ -82,6 +86,7 @@ class ChatHistoryStore(private val context: Context) {
         saveAll(trimmed)
     }
 
+    @Synchronized
     fun remove(id: String) {
         saveAll(loadAll().filter { it.id != id })
     }

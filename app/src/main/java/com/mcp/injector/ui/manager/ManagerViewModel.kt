@@ -19,6 +19,7 @@ import com.mcp.injector.data.AiRepository
 import com.mcp.injector.data.Project
 import com.mcp.injector.data.ProjectsStore
 import com.mcp.injector.data.SettingsRepository
+import com.mcp.injector.data.resolveStoredFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -82,9 +83,11 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
     fun load(packageName: String) {
         viewModelScope.launch {
             val appCtx = getApplication<Application>()
-            val record = injectedStore.find(packageName)
-                ?: InjectedAppScanner.scan(appCtx, injectedStore)
-                    .firstOrNull { it.packageName == packageName }
+            // 历史缺失时按目标 APK 内的标记识别（注入器重装后仍可管理）；要开 APK 读 assets，走 IO
+            val record = withContext(Dispatchers.IO) {
+                injectedStore.find(packageName)
+                    ?: InjectedAppScanner.recognize(appCtx, injectedStore, packageName)
+            }
             _state.update {
                 it.copy(
                     app = record,
@@ -187,7 +190,7 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
                 val appCtx = getApplication<Application>()
                 val source = resolveSourceApk(appCtx, current)
                 if (source == null) {
-                    _events.tryEmit("缺少源 APK / 注入产物，无法重新注入（同签名扫描来源无副本）")
+                    _events.tryEmit("缺少源 APK / 注入产物，无法重新注入（同签名或标记识别来源没有本地副本）")
                     return@launch
                 }
                 val info = withContext(Dispatchers.IO) { ApkParser.parse(source) }
@@ -214,7 +217,7 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
                     projectsStore.backupOutput(
                         packageName = current.packageName,
                         template = template,
-                        previousOutput = current.outputRelative?.let { File(appCtx.filesDir, it) },
+                        previousOutput = resolveStoredFile(appCtx.filesDir, current.outputRelative),
                     )
                 }
                 withContext(Dispatchers.IO) { injector.inject(source, info, plan, output) }
@@ -277,7 +280,7 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
     fun installOutput() {
         val current = _state.value.app ?: return
         val appCtx = getApplication<Application>()
-        val file = current.outputRelative?.let { File(appCtx.filesDir, it) }
+        val file = resolveStoredFile(appCtx.filesDir, current.outputRelative)
         if (file == null || !file.exists()) {
             _events.tryEmit("暂无可安装的注入产物：请先完成一次注入或重新注入")
             return
@@ -314,13 +317,10 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 重新注入源 APK：原始导入副本优先，注入产物兜底（重复注入有防护）。 */
     private fun resolveSourceApk(appCtx: Application, current: InjectedApp): File? {
-        current.sourceRelative
-            ?.let { File(appCtx.filesDir, it) }
+        resolveStoredFile(appCtx.filesDir, current.sourceRelative)
             ?.takeIf { it.exists() }
             ?.let { return it }
-        return current.outputRelative
-            ?.let { File(appCtx.filesDir, it) }
-            ?.takeIf { it.exists() }
+        return resolveStoredFile(appCtx.filesDir, current.outputRelative)?.takeIf { it.exists() }
     }
 
     /** 把诊断 JSON 的 errors/recommendations 转为规划提示（回传 AI 的载体）。 */
