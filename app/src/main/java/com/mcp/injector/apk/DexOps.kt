@@ -52,6 +52,15 @@ object DexOps {
     /** 桥接入口类完整类型描述。 */
     const val BRIDGE_CLASS = "Lcom/mcp/injector/bridge/Bridge;"
 
+    /**
+     * kotlin-stdlib 类前缀（dex 类型描述）。
+     *
+     * bridge 是 Kotlin 编译产物，运行期需要 stdlib；注入 dex 必须一并带上闭包，
+     * 否则纯 Java 目标进程会因 `NoClassDefFoundError` 在框架回调序言处闪退。
+     * 宿主 release 未开启混淆（isMinifyEnabled=false），故按包名前缀筛选即可。
+     */
+    private const val STDLIB_TYPE_PREFIX = "Lkotlin/"
+
     /** dexlib2 Opcodes：对齐反编译产物 Opcodes.forApi(35)。 */
     private val OPCODES by lazy { Opcodes.forApi(35) }
 
@@ -419,6 +428,78 @@ object DexOps {
     // bridge dex 提取（对齐反编译 extractBridgeDex）
     // ---------------------------------------------------------------------
 
+    /**
+     * 收集 bridge 类依赖的 kotlin-stdlib 类闭包（取自宿主 APK 的各 dex）。
+     *
+     * 为什么必须带：bridge 是 Kotlin 编译产物，运行期需要 kotlin-stdlib。目标 App 若是
+     * **纯 Java 应用**（进程里没有 stdlib），后果是致命的：
+     *  - `AgentReceiver.onReceive(context, intent)` 这类框架回调，**参数非空检查（Intrinsics）
+     *    在方法序言里**执行，方法体内的 try/catch 挡不住 → 异常直接抛在目标 App 主线程
+     *    → 进程被杀。表现为「已注入的 App 一点宿主重试就闪退」；
+     *  - 启动期因 BridgeInitProvider 侧有 try/catch 才没崩，但桥接全程失效，表现为
+     *    「打开软件后拿不到工具」。
+     * Kotlin 写的 App 自带 stdlib，所以一切正常——这正是「部分软件能成功、部分不行」的原因。
+     *
+     * 只取**被引用到的闭包**，不是全部 kotlin 类：体积可控，不会撑爆单 dex 方法数上限
+     * （dex 的 method id 上限 65536，全量 stdlib 接近该上限，闭包只占极小一部分）。
+     *
+     * @param seeds bridge 类；它们自身不入闭包，只有它们引用到的 kotlin 类才入。
+     */
+    private fun collectStdlibClosure(
+        container: MultiDexContainer<out DexBackedDexFile>,
+        seeds: List<ClassDef>,
+    ): List<ClassDef> {
+        // 宿主各 dex 里的 kotlin 类（type → 原始 ClassDef），供闭包查找
+        val available = HashMap<String, ClassDef>()
+        for (name in container.dexEntryNames) {
+            val dexFile = container.getEntry(name)?.dexFile as? DexBackedDexFile ?: continue
+            for (clazz in dexFile.classes) {
+                if (clazz.type.startsWith(STDLIB_TYPE_PREFIX)) available.putIfAbsent(clazz.type, clazz)
+            }
+        }
+        if (available.isEmpty()) return emptyList()
+
+        val collected = LinkedHashMap<String, ClassDef>()
+        val queued = HashSet<String>()
+        val queue = ArrayDeque<String>()
+        fun enqueue(type: String) {
+            if (type.startsWith(STDLIB_TYPE_PREFIX) && !collected.containsKey(type) && queued.add(type)) {
+                queue.add(type)
+            }
+        }
+
+        for (seed in seeds) referencedTypes(seed).forEach { enqueue(it) }
+        while (queue.isNotEmpty()) {
+            val clazz = available[queue.removeFirst()] ?: continue
+            collected[clazz.type] = ImmutableClassDef.of(clazz)
+            referencedTypes(clazz).forEach { enqueue(it) }
+        }
+        return collected.values.toList()
+    }
+
+    /** 一个类引用的全部类型描述符（父类/接口/字段类型/方法签名/指令引用），用于闭包遍历。 */
+    private fun referencedTypes(clazz: ClassDef): Set<String> {
+        val out = LinkedHashSet<String>()
+        clazz.superclass?.let { out.add(it) }
+        clazz.interfaces.forEach { out.add(it) }
+        for (f in clazz.fields) out.add(f.type.toString())
+        for (m in clazz.methods) {
+            out.add(m.returnType.toString())
+            m.parameterTypes.forEach { out.add(it.toString()) }
+            val impl = m.implementation ?: continue
+            for (insn in impl.instructions) {
+                if (insn !is ReferenceInstruction) continue
+                when (val ref = insn.reference) {
+                    is TypeReference -> out.add(ref.type)
+                    is MethodReference -> out.add(ref.definingClass)
+                    is FieldReference -> out.add(ref.definingClass)
+                    else -> {}
+                }
+            }
+        }
+        return out
+    }
+
     fun extractBridgeDex(hostApk: File, output: File): File {
         try {
             val container = loadContainer(hostApk)
@@ -438,7 +519,13 @@ object DexOps {
             if (bridgeClasses.none { it.type == BRIDGE_CLASS }) {
                 throw IllegalStateException("缺少 Bridge 入口类")
             }
-            DexFileFactory.writeDexFile(output.absolutePath, ImmutableDexFile(OPCODES, bridgeClasses))
+            // 必须连同 kotlin-stdlib 闭包一起打进注入 dex：目标进程不保证有 stdlib，
+            // 缺失时的后果见 [collectStdlibClosure]。
+            val stdlib = collectStdlibClosure(container, bridgeClasses)
+            DexFileFactory.writeDexFile(
+                output.absolutePath,
+                ImmutableDexFile(OPCODES, bridgeClasses + stdlib),
+            )
             return output
         } catch (e: Exception) {
             // 包装底层异常（如 loadDexContainer / writeDexFile 抛出的库异常），给出明确中文说明并保留 cause。

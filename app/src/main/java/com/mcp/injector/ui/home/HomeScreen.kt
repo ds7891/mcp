@@ -5,9 +5,10 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -55,6 +56,7 @@ import com.mcp.injector.data.Project
 import com.mcp.injector.ui.components.EmptyHint
 import com.mcp.injector.ui.components.SectionHeader
 import com.mcp.injector.ui.components.StatusChip
+import com.mcp.injector.ui.components.StrategyChatDialog
 import com.mcp.injector.ui.components.ProjectStatusUi
 import java.io.File
 import kotlinx.coroutines.launch
@@ -114,13 +116,24 @@ fun HomeScreen(
                     }
                 }
             }
+            item {
+                Text(
+                    text = "长按下方任意卡片，可打开 AI 调试对话反馈问题并由 AI 调整注入策略",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (state.injectedApps.isEmpty()) {
                 item {
                     EmptyHint(body = "暂无已注入应用：从右下/顶部导入 APK 完成首次注入")
                 }
             } else {
                 items(state.injectedApps, key = { it.packageName }) { app ->
-                    InjectedAppCard(app = app, onClick = { onOpenManager(app.packageName) })
+                    InjectedAppCard(
+                        app = app,
+                        onClick = { onOpenManager(app.packageName) },
+                        onLongClick = { vm.openStrategyChat(app.packageName) },
+                    )
                 }
             }
 
@@ -138,6 +151,7 @@ fun HomeScreen(
                             }
                         },
                         onDelete = { vm.deleteProject(project.id) },
+                        onLongClick = { vm.openStrategyChat(project.packageName) },
                         iconFile = vm.iconOf(project),
                         outputFile = vm.outputFor(project),
                     )
@@ -148,16 +162,33 @@ fun HomeScreen(
             hostState = snackbar,
             modifier = Modifier.align(Alignment.BottomCenter),
         )
+        state.strategyChat?.let { chat ->
+            StrategyChatDialog(
+                appName = chat.appName,
+                contextNote = chat.contextNote,
+                turns = chat.turns,
+                input = chat.input,
+                thinking = chat.thinking,
+                applying = chat.applying,
+                changes = chat.changes,
+                error = chat.error,
+                onInputChange = { vm.updateChatInput(it) },
+                onSend = { vm.sendChatProblem() },
+                onApply = { vm.applyChatPatchAndReinject() },
+                onDismiss = { vm.dismissStrategyChat() },
+            )
+        }
     }
 }
 
-/** 已注入应用卡片：来源（历史/扫描）+ 包名/版本 + 端口 + 管理入口。 */
+/** 已注入应用卡片：来源（历史/扫描）+ 包名/版本 + 端口 + 管理入口；长按打开 AI 调试对话。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun InjectedAppCard(app: InjectedApp, onClick: () -> Unit) {
+private fun InjectedAppCard(app: InjectedApp, onClick: () -> Unit, onLongClick: () -> Unit) {
     ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.elevatedCardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -229,12 +260,15 @@ private fun sourceLabel(source: String): String = when (source) {
 
 /**
  * 工程卡片（对齐反编译 ProjectCard 布局：图标/名称/包名/StatusChip + 忙碌进度条 + 失败错误 + 展开操作区）。
+ * 长按打开 AI 调试对话（反馈问题 → AI 调整注入策略）。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProjectCard(
     project: Project,
     onInstall: (File) -> Unit,
     onDelete: () -> Unit,
+    onLongClick: () -> Unit,
     iconFile: File?,
     outputFile: File?,
 ) {
@@ -242,7 +276,10 @@ private fun ProjectCard(
     ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { expanded = !expanded },
+            .combinedClickable(
+                onClick = { expanded = !expanded },
+                onLongClick = onLongClick,
+            ),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.elevatedCardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow,

@@ -36,6 +36,14 @@ data class ToolTarget(
     val component: String? = null,
     val uri: String? = null,
     val contentMethod: String? = null,
+    /**
+     * content_call 的 provider authorities。
+     *
+     * 必须显式声明：AiPlanner 用 ignoreUnknownKeys 解码模型输出，模型按提示词填的
+     * `authorities` 若不在模型里会被静默丢弃，config 序列化后 ToolExecutor 读不到，
+     * content_call 工具一律失败于「缺少 authorities」。
+     */
+    val authorities: String? = null,
     val methodClass: String? = null,
     val methodName: String? = null,
     val extras: Map<String, String> = emptyMap(),

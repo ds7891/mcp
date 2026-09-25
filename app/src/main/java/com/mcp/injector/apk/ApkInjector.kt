@@ -297,8 +297,10 @@ class ApkInjector(private val context: Context) {
          *
          * v3：BridgeInitProvider 的崩溃采集与桥接启动改为各自独立 try，修复
          *     「崩溃采集抛异常导致注入体完全不启动」。
+         * v4：注入 dex 一并打包 kotlin-stdlib 闭包，修复纯 Java 目标应用因缺 stdlib
+         *     在 AgentReceiver 回调序言处闪退（宿主「重试」时目标进程被杀）。
          */
-        const val BRIDGE_PAYLOAD_VERSION = 3
+        const val BRIDGE_PAYLOAD_VERSION = 4
 
         const val PORT_MIN = 1024
         const val PORT_MAX = 9999

@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.json.JSONObject
+import java.util.Locale
 
 /**
  * 注入方案规划器（AI 层）。
@@ -19,8 +20,10 @@ import org.json.JSONObject
  * 容错策略（P0）：
  * 1. 容忍 ```json 代码块包裹、前后缀文本、字段缺失（ignoreUnknownKeys + isLenient，并截取首个 `{` 到末个 `}`）。
  * 2. 请求失败或解析失败时，把错误信息回灌进 prompt 重试，最多 [MAX_RETRIES] 次。
- * 3. 重试仍失败才降级为内置保守方案，并把错误写入 [InjectionPlan.lastError]、
- *    重试次数写入 [InjectionPlan.retryCount]——绝不静默产出仅 open_app 的弱计划。
+ * 3. 重试仍失败才降级为内置保守方案：此时不再只给通用 open_app，而是用清单组件
+ *    （见 [componentTools]）确定性地生成该应用专属的工具集，保证「每个应用都有专属工具」；
+ *    错误写入 [InjectionPlan.lastError]、重试次数写入 [InjectionPlan.retryCount]——绝不静默。
+ *    模型虽有产出但工具数过少（< [MIN_MODEL_TOOLS]）时，同样用清单组件补齐。
  * 4. 配置类错误（[ApiKeyMissingException]，未填 Key / 填了旧版演示 Key）不属于"解析失败"：
  *    重试与降级均无意义，直接上抛由调用方引导用户到设置页，而不是静默降级。
  * 5. 模型若只返回 tool_calls（content 为空）：规划阶段没有可执行 MCP 工具的运行时
@@ -128,18 +131,26 @@ class AiPlanner(private val repo: AiRepository) {
         }
         // 策略：仅当模型选择 service 且用户偏好 service 时才用 service，否则统一 hook
         val strategy = if (plan.strategy == "service" && settings.preferServiceStrategy) "service" else "hook"
-        val tools = plan.tools
+        val modelTools = plan.tools
             .filter { toolNameRegex.matches(it.name) }
             .take(MAX_TOOLS)
-        if (tools.isEmpty()) {
+        if (modelTools.isEmpty()) {
             throw IllegalArgumentException("工具列表为空或工具名不合法")
+        }
+        // 模型产出的工具过少时，用清单组件做确定性补齐：保证「每个应用都有专属工具」，
+        // 不因模型能力或上下文波动退化成只有通用工具。同名以模型为准。
+        val tools = if (modelTools.size < MIN_MODEL_TOOLS) {
+            val seen = modelTools.mapTo(HashSet()) { it.name }
+            (modelTools + componentTools(info).filter { it.name !in seen }).take(MAX_TOOLS)
+        } else {
+            modelTools
         }
         val wire = ConnectionMode.fromWire(plan.connectionMode).wire
         val port = if (plan.port in 1024..9999) plan.port else settings.mcpPort
         return plan.copy(strategy = strategy, connectionMode = wire, port = port, tools = tools)
     }
 
-    /** 降级方案：仅暴露应用启动能力，绝不静默——错误与重试次数一并记录。 */
+    /** 降级方案：用清单组件自动生成专属工具；一个都生成不出来才退回 open_app。绝不静默。 */
     private fun fallbackPlan(info: ApkInfo, settings: AppSettings, lastError: String, retryCount: Int): InjectionPlan {
         val launcherActivity = info.launcherActivity ?: "${info.packageName}.MainActivity"
         val openApp = McpToolDef(
@@ -148,16 +159,140 @@ class AiPlanner(private val repo: AiRepository) {
             inputSchema = simpleSchema(),
             target = ToolTarget(kind = "start_activity", component = launcherActivity),
         )
+        val byComponent = componentTools(info)
+        val tools = when {
+            byComponent.isEmpty() -> listOf(openApp)
+            byComponent.none { it.name == "open_app" } -> (listOf(openApp) + byComponent).take(MAX_TOOLS)
+            else -> byComponent
+        }
         return InjectionPlan(
             strategy = if (settings.preferServiceStrategy) "service" else "hook",
-            reason = "模型规划不可用，已使用内置保守方案：仅暴露应用启动能力。",
+            reason = "模型规划不可用，已降级为按清单组件自动生成的保守工具集（仅启动与只读类操作）。",
             connectionMode = ConnectionMode.StreamableHttp.wire,
             port = settings.mcpPort,
-            tools = listOf(openApp),
+            tools = tools,
             lastError = lastError,
             retryCount = retryCount,
         )
     }
+
+    /**
+     * 确定性工具生成：直接用清单组件造工具，**完全不依赖模型**。
+     *
+     * 模型不可用（未配 Key 之外的原因：网络、返回非法 JSON、工具名全不合法）时，
+     * 由它保证「每个应用都有专属工具列表」，而不是只剩一条通用 open_app。
+     *
+     * 只生成启动类与只读类动作，不生成任何写操作：
+     * - 启动器 → `open_app`；其余 activity → `open_<组件名>`（start_activity）；
+     * - exported service → `start_<组件名>`（start_service）；
+     * - exported receiver → `send_<组件名>`（broadcast，带上其声明的首个 action）；
+     * - 有 authorities 的 provider → `query_<组件名>`（content_call，固定 contentMethod=query，
+     *   刻意不生成 insert/update/delete，避免 AI 判断失误时改坏用户数据）。
+     *
+     * 工具名按组件简单类名转下划线；总数受 [MAX_TOOLS] 限制；名字不合法或不满足
+     * [toolNameRegex] 的组件直接丢弃。
+     */
+    private fun componentTools(info: ApkInfo): List<McpToolDef> {
+        val out = linkedMapOf<String, McpToolDef>()
+        val label = info.appLabel?.takeIf { it.isNotBlank() } ?: info.packageName
+        val launcher = info.launcherActivity
+
+        if (launcher != null) {
+            addComponentTool(
+                out,
+                McpToolDef(
+                    name = "open_app",
+                    description = "打开 $label 的主界面",
+                    inputSchema = simpleSchema(),
+                    target = ToolTarget(kind = "start_activity", component = launcher),
+                ),
+            )
+        }
+
+        for (component in info.activities) {
+            if (component.kind != "activity" && component.kind != "activity-alias") continue
+            // activity-alias 实际启动的是 targetActivity
+            val target = component.targetActivity ?: component.name
+            if (target == launcher) continue
+            addComponentTool(
+                out,
+                McpToolDef(
+                    name = "open_${snakeName(target)}",
+                    description = "打开 $label 的 ${shortName(target)} 页面",
+                    inputSchema = simpleSchema(),
+                    target = ToolTarget(kind = "start_activity", component = target),
+                ),
+            )
+        }
+
+        for (component in info.services) {
+            if (component.exported != true) continue
+            addComponentTool(
+                out,
+                McpToolDef(
+                    name = "start_${snakeName(component.name)}",
+                    description = "启动 $label 的服务 ${shortName(component.name)}",
+                    inputSchema = simpleSchema(),
+                    target = ToolTarget(kind = "start_service", component = component.name),
+                ),
+            )
+        }
+
+        for (component in info.receivers) {
+            if (component.exported != true) continue
+            addComponentTool(
+                out,
+                McpToolDef(
+                    name = "send_${snakeName(component.name)}",
+                    description = "向 $label 的接收器 ${shortName(component.name)} 发送广播",
+                    inputSchema = simpleSchema(),
+                    target = ToolTarget(
+                        kind = "broadcast",
+                        component = component.name,
+                        action = component.actions.firstOrNull(),
+                    ),
+                ),
+            )
+        }
+
+        for (component in info.providers) {
+            if (component.authorities.isNullOrBlank()) continue
+            addComponentTool(
+                out,
+                McpToolDef(
+                    name = "query_${snakeName(component.name)}",
+                    description = "读取 $label 的数据提供者 ${shortName(component.name)}",
+                    inputSchema = simpleSchema(),
+                    target = ToolTarget(
+                        kind = "content_call",
+                        contentMethod = "query",
+                        authorities = component.authorities,
+                    ),
+                ),
+            )
+        }
+
+        return out.values.toList()
+    }
+
+    /** 收下一条确定性工具：总数受 [MAX_TOOLS] 限制，名字不合法则丢弃，同名只留先到的。 */
+    private fun addComponentTool(out: MutableMap<String, McpToolDef>, tool: McpToolDef) {
+        if (out.size >= MAX_TOOLS) return
+        if (!toolNameRegex.matches(tool.name)) return
+        out.putIfAbsent(tool.name, tool)
+    }
+
+    /** 组件完整类名 → 工具名片段（小写下划线，截断到 28 字符以留出前缀余量）。 */
+    private fun snakeName(className: String): String = className
+        .substringAfterLast('.')
+        .replace(Regex("(?<=[a-z0-9])(?=[A-Z])"), "_")
+        .replace(Regex("[^A-Za-z0-9]+"), "_")
+        .lowercase(Locale.ROOT)
+        .trim('_')
+        .take(28)
+
+    /** 组件简单类名（用于工具描述）。 */
+    private fun shortName(className: String): String = className.substringAfterLast('.')
 
     private fun systemPrompt(settings: AppSettings): String = """
         |
@@ -404,6 +539,12 @@ class AiPlanner(private val repo: AiRepository) {
 
     private companion object {
         const val MAX_TOOLS = 16
+
+        /**
+         * 模型工具数低于该值时，用清单组件做确定性补齐。
+         * 与提示词里「工具数量控制在 3 到 8 个」的下限对齐。
+         */
+        const val MIN_MODEL_TOOLS = 3
 
         /** 崩溃栈回灌上限（字符）：只取尾部，避免撑爆小上下文模型。 */
         const val CRASH_HINT_LIMIT = 4000
