@@ -10,6 +10,7 @@
          （本地/局域网的 OpenAI 兼容服务、以及 127.0.0.1 环回桥接），故显式放开。 -->
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:name="com.mcp.injector.InjectorApp"
         android:supportsRtl="true"

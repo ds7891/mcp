@@ -27,6 +27,13 @@ data class Project(
     val outputRelative: String? = null,
     val error: String? = null,
     val plan: InjectionPlan? = null,
+    /**
+     * 是否为「调整前的原始备份」工程。
+     *
+     * 「应用并重新注入」会把调整前的产物另存一份并落成该标记的工程，卡片名称右侧显示
+     * 「备份」标签；新注入版本不可用时，直接安装这条备份即可回退。
+     */
+    val isBackup: Boolean = false,
 ) {
     /** 状态常量与忙碌状态集合（对齐反编译 Project$Status）。 */
     object Status {
@@ -96,4 +103,46 @@ class ProjectsStore(private val context: Context) {
     /** 注入产物输出目录（filesDir/outputs）。 */
     fun outputDir(): File =
         File(context.filesDir, "outputs").apply { mkdirs() }
+
+    /**
+     * 备份「调整前的产物」并落一条 [Project.isBackup]=true 的工程，供重新注入后回退安装。
+     *
+     * 首页 AI 对话的「应用并重新注入」与管理页的「重新注入」共用这里：必须在覆盖主产物
+     * 之前调用，工程列表才会由一份变两份——新的注入版本 + 名称右侧带「备份」标签的原始版本。
+     * 重复调整时复用同一条备份工程（同 id，沿用原 createdAt），不会越攒越多。
+     *
+     * @param packageName 目标包名（决定备份文件名）
+     * @param template 主工程，提供 appName/versionName/iconFile/createdAt/plan（备份工程据此落档）
+     * @param previousOutput 当前产物文件；null 或不存在表示无可备份产物
+     * @return 备份产物文件；无可备份产物或复制失败返回 null
+     */
+    fun backupOutput(packageName: String, template: Project, previousOutput: File?): File? {
+        if (previousOutput == null || !previousOutput.exists()) return null
+        val backupFile = File(outputDir(), sanitizeName(packageName) + "-backup-mcp.apk")
+        val copied = runCatching {
+            previousOutput.copyTo(backupFile, overwrite = true)
+        }.isSuccess && backupFile.exists()
+        if (!copied) return null
+        // 备份条目：沿用同一 id（重复调整只更新这一条），createdAt 排在主工程之后
+        val seed = loadAll().firstOrNull { it.isBackup && it.packageName == packageName }
+            ?: template.copy(
+                id = UUID.randomUUID().toString(),
+                isBackup = true,
+                createdAt = template.createdAt - 1,
+            )
+        upsert(
+            seed.copy(
+                status = Project.Status.DONE,
+                outputRelative = backupFile.relativeTo(context.filesDir).path,
+                plan = template.plan,
+                error = null,
+                isBackup = true,
+            ),
+        )
+        return backupFile
+    }
+
+    /** 产物文件名净化：与注入产物命名规则一致（非字母数字下划线连字符一律替换）。 */
+    private fun sanitizeName(raw: String): String =
+        raw.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
 }

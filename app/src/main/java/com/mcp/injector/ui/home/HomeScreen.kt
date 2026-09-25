@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -48,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
@@ -172,10 +174,16 @@ fun HomeScreen(
                 applying = chat.applying,
                 changes = chat.changes,
                 error = chat.error,
+                historyOpen = chat.historyOpen,
+                sessions = chat.sessions,
                 onInputChange = { vm.updateChatInput(it) },
                 onSend = { vm.sendChatProblem() },
                 onApply = { vm.applyChatPatchAndReinject() },
                 onDismiss = { vm.dismissStrategyChat() },
+                onToggleHistory = { vm.toggleChatHistory() },
+                onOpenSession = { vm.openChatSession(it) },
+                onNewSession = { vm.newChatSession() },
+                onDeleteSession = { vm.deleteChatSession(it) },
             )
         }
     }
@@ -304,12 +312,20 @@ private fun ProjectCard(
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = project.appName,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = project.appName,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        // 「应用并重新注入」会自动留一份调整前的原始备份，名称右侧标出来便于区分
+                        if (project.isBackup) {
+                            Spacer(Modifier.width(8.dp))
+                            BackupChip()
+                        }
+                    }
                     Text(
                         text = project.packageName,
                         style = MaterialTheme.typography.bodyMedium,
@@ -346,6 +362,25 @@ private fun ProjectCard(
                 }
             }
         }
+    }
+}
+
+/**
+ * 「备份」标签：标记「应用并重新注入」时自动留存的调整前版本。
+ * 与新注入版本在卡片名称右侧形成明显区分，便于用户回退安装。
+ */
+@Composable
+private fun BackupChip() {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+    ) {
+        Text(
+            text = "备份",
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
     }
 }
 

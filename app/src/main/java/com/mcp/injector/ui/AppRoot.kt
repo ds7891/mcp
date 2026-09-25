@@ -24,6 +24,7 @@ import com.mcp.injector.ui.home.HomeScreen
 import com.mcp.injector.ui.home.HomeViewModel
 import com.mcp.injector.ui.manager.ManagerScreen
 import com.mcp.injector.ui.manager.ManagerViewModel
+import com.mcp.injector.ui.settings.AboutScreen
 import com.mcp.injector.ui.settings.SettingsScreen
 import com.mcp.injector.ui.settings.SettingsViewModel
 
@@ -44,8 +45,9 @@ private val tabs = listOf(
  *
  * Scaffold + 底部导航 + NavHost：
  * - "home"：主页（工程列表 + 已注入应用），点击已注入应用 → "manager/{pkg}"；
- * - "settings"：设置页；
- * - "manager/{pkg}"：Manager 详情页（任务 C 新增路由，不带底部栏）。
+ * - "settings"：设置页（顶部「关于」入口 → "about"）；
+ * - "manager/{pkg}"：Manager 详情页（任务 C 新增路由，不带底部栏）；
+ * - "about"：关于页（版本 / 开发者 / 群聊 / 赞助，不带底部栏）。
  */
 @Composable
 fun AppRoot() {
@@ -55,8 +57,8 @@ fun AppRoot() {
 
     Scaffold(
         bottomBar = {
-            // Manager 详情页隐藏底部栏（自带返回顶栏）
-            if (currentRoute != MANAGER_ROUTE) {
+            // Manager 详情页与关于页隐藏底部栏（均自带返回顶栏）
+            if (currentRoute != MANAGER_ROUTE && currentRoute != ABOUT_ROUTE) {
                 NavigationBar {
                 tabs.forEach { tab ->
                     NavigationBarItem(
@@ -92,7 +94,13 @@ fun AppRoot() {
                 )
             }
             composable("settings") {
-                SettingsScreen(vm = viewModel<SettingsViewModel>())
+                SettingsScreen(
+                    vm = viewModel<SettingsViewModel>(),
+                    onOpenAbout = { navController.navigate(ABOUT_ROUTE) },
+                )
+            }
+            composable(ABOUT_ROUTE) {
+                AboutScreen(onBack = { navController.popBackStack() })
             }
             composable(
                 route = MANAGER_ROUTE,
@@ -109,3 +117,4 @@ fun AppRoot() {
 }
 
 private const val MANAGER_ROUTE = "manager/{pkg}"
+private const val ABOUT_ROUTE = "about"

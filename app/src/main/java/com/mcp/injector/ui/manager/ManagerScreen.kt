@@ -160,6 +160,7 @@ fun ManagerScreen(
                         app = app,
                         busy = state.busy,
                         onReinject = { vm.reinject() },
+                        onInstall = { vm.installOutput() },
                     )
                 }
 
@@ -438,9 +439,14 @@ private fun DiagnoseCard(
     }
 }
 
-/** 重新注入卡片：无诊断的直接重注入（优先原始导入源，其次注入产物）。 */
+/** 重新注入卡片：无诊断的直接重注入（优先原始导入源，其次注入产物）；重注入会先留原始备份。 */
 @Composable
-private fun ReinjectCard(app: InjectedApp, busy: Boolean, onReinject: () -> Unit) {
+private fun ReinjectCard(
+    app: InjectedApp,
+    busy: Boolean,
+    onReinject: () -> Unit,
+    onInstall: () -> Unit,
+) {
     DetailCard {
         Column(modifier = Modifier.padding(16.dp)) {
             val source = if (app.source == "scan") "同签名扫描来源，无注入副本" else "有注入副本（源 APK 优先）"
@@ -448,6 +454,21 @@ private fun ReinjectCard(app: InjectedApp, busy: Boolean, onReinject: () -> Unit
             Button(onClick = onReinject, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                 Text("重新注入")
             }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onInstall,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("安装当前产物")
+            }
+            Text(
+                text = "重新注入会先留一份调整前的「备份」工程（首页工程列表可见，名称右侧带「备份」标签），" +
+                    "再生成新的注入版本；两份都能直接安装，新版本不可用时装备份即可回退。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
         }
     }
 }

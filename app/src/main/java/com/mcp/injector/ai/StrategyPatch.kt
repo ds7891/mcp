@@ -12,6 +12,8 @@ data class CurrentStrategy(
     val strategy: String,
     val connectionMode: String,
     val port: Int,
+    /** 当前已注册工具数（用于展示「工具集 N → M」的改动点）。 */
+    val toolsCount: Int = 0,
 ) {
     companion object {
         /** 从注入历史记录的字段还原（缺省按 provider 策略的默认值）。 */
@@ -21,12 +23,14 @@ data class CurrentStrategy(
             strategy: String?,
             connectionMode: String?,
             port: Int,
+            toolsCount: Int = 0,
         ): CurrentStrategy = CurrentStrategy(
             entryPoint = StrategyPatch.normalizeEntryPoint(entryPoint ?: "provider"),
             toastOnBoot = toastOnBoot,
             strategy = if (strategy == "service") "service" else "hook",
             connectionMode = ConnectionMode.fromWire(connectionMode).wire,
             port = port,
+            toolsCount = toolsCount,
         )
     }
 }
@@ -55,6 +59,14 @@ data class StrategyPatch(
     val connectionMode: String? = null,
     /** 监听端口（1024-9999）。 */
     val port: Int? = null,
+    /**
+     * 工具集整体替换（null = 不改）。
+     *
+     * 工具不是「策略微调」能解决的：模型在 [reviseStrategy] 里拿不到 dex 候选方法，
+     * 无法凭空设计工具，所以这里通常由宿主在「应用并重新注入」时用完整规划（带 dex 提示）
+     * 重新规划后回填，形成**可执行、可见、可备份**的改动。
+     */
+    val tools: List<McpToolDef>? = null,
     /** 中文说明：为什么这样调、预期解决什么。 */
     val explanation: String = "",
 ) {
@@ -62,7 +74,7 @@ data class StrategyPatch(
     /** 是否没有任何实际改动（AI 可能只给文字建议）。 */
     fun isEmpty(): Boolean =
         entryPoint == null && toastOnBoot == null && strategy == null &&
-            connectionMode == null && port == null
+            connectionMode == null && port == null && tools == null
 
     /** 生成中文「改动点」列表；非法/越界值不列出（它们会被 [applyTo] 忽略）。 */
     fun describeChanges(current: CurrentStrategy): List<String> {
@@ -85,6 +97,17 @@ data class StrategyPatch(
         port?.let { p ->
             if (p in PORT_MIN..PORT_MAX && p != current.port) out.add("端口：${current.port} → $p")
         }
+        tools?.let { t ->
+            val names = t.take(6).joinToString("、") { it.name }
+            val more = if (t.size > 6) "…" else ""
+            out.add(
+                if (t.isEmpty()) {
+                    "工具集：清空（当前 ${current.toolsCount} 个）"
+                } else {
+                    "工具集：重新规划（当前 ${current.toolsCount} 个 → ${t.size} 个：$names$more）"
+                },
+            )
+        }
         return out
     }
 
@@ -95,6 +118,7 @@ data class StrategyPatch(
         strategy = strategy?.let { if (it == "service") "service" else "hook" } ?: plan.strategy,
         connectionMode = connectionMode?.let { ConnectionMode.fromWire(it).wire } ?: plan.connectionMode,
         port = port?.takeIf { it in PORT_MIN..PORT_MAX } ?: plan.port,
+        tools = tools ?: plan.tools,
     )
 
     companion object {

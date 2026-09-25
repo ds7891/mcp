@@ -1,6 +1,8 @@
 package com.mcp.injector.ui.manager
 
 import android.app.Application
+import android.content.Intent
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mcp.injector.InjectorApp
@@ -14,6 +16,8 @@ import com.mcp.injector.apk.ApkInjector
 import com.mcp.injector.apk.ApkParser
 import com.mcp.injector.apk.DexOps
 import com.mcp.injector.data.AiRepository
+import com.mcp.injector.data.Project
+import com.mcp.injector.data.ProjectsStore
 import com.mcp.injector.data.SettingsRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -45,6 +49,7 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
     private val injectedStore: InjectedAppsStore = (app as InjectorApp).injectedAppsStore
     private val moduleScope: ModuleScope = (app as InjectorApp).moduleScope
     private val settingsRepo: SettingsRepository = (app as InjectorApp).settingsRepository
+    private val projectsStore: ProjectsStore = (app as InjectorApp).projectsStore
 
     private val ai = AiRepository()
     private val planner = AiPlanner(ai)
@@ -196,7 +201,33 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
                 val plan = planner.plan(info, hints, settings, diagnoseNotes)
 
                 val output = File(File(appCtx.filesDir, "outputs"), sanitize(info.packageName) + "-mcp.apk")
+                // 与首页「应用并重新注入」一致：先留一份调整前的原始备份，再覆盖主产物，
+                // 使工程列表由一份变两份（新注入版本 + 名称右侧带「备份」标签的原始版本）。
+                val existingProject = projectsStore.loadAll()
+                    .firstOrNull { it.packageName == current.packageName && !it.isBackup }
+                val template = existingProject ?: Project(
+                    appName = current.appName,
+                    packageName = current.packageName,
+                    versionName = current.versionName,
+                )
+                val backupFile = withContext(Dispatchers.IO) {
+                    projectsStore.backupOutput(
+                        packageName = current.packageName,
+                        template = template,
+                        previousOutput = current.outputRelative?.let { File(appCtx.filesDir, it) },
+                    )
+                }
                 withContext(Dispatchers.IO) { injector.inject(source, info, plan, output) }
+                // 主工程更新为新的注入版本（备份那条已由 backupOutput 落盘）
+                projectsStore.upsert(
+                    template.copy(
+                        status = Project.Status.DONE,
+                        outputRelative = output.relativeTo(appCtx.filesDir).path,
+                        plan = plan,
+                        error = null,
+                        isBackup = false,
+                    ),
+                )
 
                 // 注入器内部已写入历史（新 installId/端口/模块）；此处重载并刷新
                 val fresh = injectedStore.find(current.packageName)
@@ -212,10 +243,16 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
                 refreshStatus()
                 refreshDiagnose()
                 _events.tryEmit(
-                    if (useDiagnose) {
-                        "诊断回传再注入完成：${info.appLabel ?: info.packageName}"
-                    } else {
-                        "重新注入完成：${info.appLabel ?: info.packageName}"
+                    buildString {
+                        append(if (useDiagnose) "诊断回传再注入完成：" else "重新注入完成：")
+                        append(info.appLabel ?: info.packageName)
+                        append(
+                            if (backupFile != null) {
+                                "（已生成原始备份，可在首页工程列表回退安装）"
+                            } else {
+                                "（原工程无产物可备份，只生成了注入版本）"
+                            },
+                        )
                     },
                 )
             } catch (t: Throwable) {
@@ -234,6 +271,33 @@ class ManagerViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(app = null, statusJson = null, diagnoseJson = null) }
             _events.tryEmit("已从历史移除 ${current.appName}")
         }
+    }
+
+    /** 安装当前注入产物（系统安装器）；无产物时给出可读提示。 */
+    fun installOutput() {
+        val current = _state.value.app ?: return
+        val appCtx = getApplication<Application>()
+        val file = current.outputRelative?.let { File(appCtx.filesDir, it) }
+        if (file == null || !file.exists()) {
+            _events.tryEmit("暂无可安装的注入产物：请先完成一次注入或重新注入")
+            return
+        }
+        val result = runCatching {
+            val uri = FileProvider.getUriForFile(appCtx, appCtx.packageName + ".fileprovider", file)
+            appCtx.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
+        }
+        _events.tryEmit(
+            result.fold(
+                onSuccess = { "已拉起系统安装器：${file.name}" },
+                onFailure = { "安装失败：${it.message ?: it.javaClass.simpleName}" },
+            ),
+        )
     }
 
     // ---------------------------------------------------------------------

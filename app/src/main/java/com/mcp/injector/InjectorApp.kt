@@ -4,6 +4,7 @@ import android.app.Application
 import com.mcp.injector.agent.InjectedAppsStore
 import com.mcp.injector.agent.ModuleScope
 import com.mcp.injector.crash.CrashGuard
+import com.mcp.injector.data.ChatHistoryStore
 import com.mcp.injector.data.ProjectsStore
 import com.mcp.injector.data.SettingsRepository
 
@@ -36,6 +37,10 @@ class InjectorApp : Application() {
     lateinit var moduleScope: ModuleScope
         private set
 
+    /** AI 调试对话历史仓库（长按工程/已注入应用的对话记录）。 */
+    lateinit var chatHistoryStore: ChatHistoryStore
+        private set
+
     override fun onCreate() {
         super.onCreate()
         // 崩溃护卫务必最先安装：捕获任何线程的未捕获异常并强制回退到日志页。
@@ -44,6 +49,7 @@ class InjectorApp : Application() {
         settingsRepository = SettingsRepository(this)
         projectsStore = ProjectsStore(this)
         injectedAppsStore = InjectedAppsStore(this)
+        chatHistoryStore = ChatHistoryStore(this)
         moduleScope = ModuleScope(this)
     }
 }

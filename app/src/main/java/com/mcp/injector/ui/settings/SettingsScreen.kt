@@ -1,6 +1,7 @@
 package com.mcp.injector.ui.settings
 
 import android.content.Intent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +15,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.ArrowForward
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -22,6 +26,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -53,10 +58,15 @@ import com.mcp.injector.ui.components.SectionHeader
  *
  * 无内置 Key：API Key 缺省为空，AI 注入规划前必须在此填写（AiRepository 未填写会抛
  * ApiKeyMissingException 并引导至此页）。
+ *
+ * 顶部「关于」入口由 [onOpenAbout] 跳转到关于页（版本 / 开发者 / 群聊 / 赞助）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
+fun SettingsScreen(
+    vm: SettingsViewModel = viewModel(),
+    onOpenAbout: () -> Unit = {},
+) {
     val state by vm.state.collectAsState()
     val snackbar = remember { SnackbarHostState() }
 
@@ -73,6 +83,39 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                item {
+                    SectionHeader("关于")
+                    SettingsCard {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClick = onOpenAbout)
+                                .padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Info,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("关于本软件", style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    text = "版本信息 / 开发者 / 交流群 / 赞助",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Outlined.ArrowForward,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
                 item {
                     SectionHeader("AI 接口（必填，无内置 Key）")
                     SettingsCard {
